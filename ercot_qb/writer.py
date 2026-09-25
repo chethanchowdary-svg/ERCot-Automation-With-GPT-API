@@ -13,6 +13,13 @@ HDR_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
 BODY_FONT = Font(name="Arial", size=10)
 WRAP_COLS = {"Analyst comments", "Proposed changes", "Detail", "Reason"}
 CHANGED_FILL = PatternFill("solid", start_color="FFF2CC")   # light yellow = value changed
+GPT_FILL = PatternFill("solid", start_color="C6EFCE")       # light green = matched by GPT (ID added)
+GPT_COLS = ("Project ID", "Project name", "Interconnection ID")
+
+
+def _is_gpt(r) -> bool:
+    """Existing rows only gain an Interconnection ID through the GPT / manual ID match."""
+    return "Interconnection ID" in r.get("_changed", ())
 
 
 def _money(v):
@@ -26,11 +33,14 @@ def _sheet(wb, title, columns, rows, widths=None):
     for c in ws[1]:
         c.fill, c.font = HDR_FILL, HDR_FONT
         c.alignment = Alignment(wrap_text=True, vertical="center")
-    changed_cells = []
+    rows = sorted(rows, key=lambda r: not _is_gpt(r))          # GPT-matched rows on top
+    changed_cells, gpt_cells = [], []
     for n, r in enumerate(rows, start=2):
         for col in r.get("_changed", ()):
             if col in columns:
                 changed_cells.append((n, columns.index(col) + 1))
+        if _is_gpt(r):
+            gpt_cells += [(n, columns.index(c) + 1) for c in GPT_COLS if c in columns]
         vals = []
         for col in columns:
             v = r.get(col, "")
@@ -47,6 +57,8 @@ def _sheet(wb, title, columns, rows, widths=None):
                 c.alignment = Alignment(vertical="top")
     for rr, cc in changed_cells:
         ws.cell(rr, cc).fill = CHANGED_FILL
+    for rr, cc in gpt_cells:
+        ws.cell(rr, cc).fill = GPT_FILL
     for i, col in enumerate(columns, 1):
         w = (widths or {}).get(col) or (60 if col in WRAP_COLS else min(max(len(col) + 2, 12), 36))
         ws.column_dimensions[get_column_letter(i)].width = w
