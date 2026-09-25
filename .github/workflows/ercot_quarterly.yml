@@ -1,0 +1,67 @@
+name: ERCOT quarterly Quickbase update
+
+on:
+  schedule:
+    # 06:00 UTC on the 5th of Jan, Apr, Jul and Oct (ERCOT posts the GIS report around the 1st)
+    - cron: "0 6 5 1,4,7,10 *"
+  workflow_dispatch:
+    inputs:
+      ercot_name:
+        description: "ERCOT file to use, e.g. GIS_Report_August2026 (blank = latest)"
+        required: false
+        default: ""
+      ercot_file:
+        description: "OR a GIS report xlsx committed to this repo, e.g. inputs/GIS_Report_August2026.xlsx"
+        required: false
+        default: ""
+      run_date:
+        description: "Present date for estimates, YYYY-MM-DD (blank = today)"
+        required: false
+        default: ""
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Unit tests
+        run: python -m pytest -q tests
+
+      - name: Build upload sheets
+        env:
+          QB_REALM: ${{ vars.QB_REALM || 'enerdatics.quickbase.com' }}
+          QB_TABLE_ID: ${{ vars.QB_TABLE_ID || 'bs8th2g3g' }}
+          QB_REPORT_ID: ${{ vars.QB_REPORT_ID || '1000697' }}
+          QB_NOID_REPORT_ID: ${{ vars.QB_NOID_REPORT_ID }}
+          QB_USER_TOKEN: ${{ secrets.QB_USER_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
+          GPT_MAX_CALLS: ${{ vars.GPT_MAX_CALLS || '600' }}
+          ERCOT_PROXY: ${{ secrets.ERCOT_PROXY }}
+          IN_NAME: ${{ inputs.ercot_name }}
+          IN_FILE: ${{ inputs.ercot_file }}
+          IN_DATE: ${{ inputs.run_date }}
+        run: |
+          args=(--out-dir outputs)
+          if [ -n "$IN_FILE" ]; then args+=(--ercot-file "$IN_FILE"); fi
+          if [ -n "$IN_NAME" ]; then args+=(--ercot-name "$IN_NAME"); fi
+          if [ -n "$IN_DATE" ]; then args+=(--run-date "$IN_DATE"); fi
+          python -m ercot_qb.main "${args[@]}"
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ercot-qb-update-${{ github.run_number }}
+          path: outputs/
+          retention-days: 90
