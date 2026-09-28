@@ -92,17 +92,23 @@ def investment_section(inv: float, metric: float, secname: str) -> str:
             "scale and size in the region.")
 
 
-def timeline_section(fc_status, fc, op_status, op, lifecycle, secname) -> str | None:
+def timeline_section(fc_status, fc, op_status, op, lifecycle, secname, run=None) -> str | None:
     basis = (f"-- This estimate is based on reported development timelines for {secname} "
              "projects of this scale and size in the region.")
+    past_fc = run is not None and fc is not None and fc < run
+    believes = ("-- Further, Enerdatics believes that the developer would have secured financing "
+                if past_fc else
+                "-- Further, Enerdatics believes that the developer will have secured financing ")
     if fc_status == "Reported" and op_status == "Reported":
         return None
     if fc_status == "Reported" and op_status == "Estimated":              # Case 2
+        fc_line = (f"-- Further, the developer secured financing to fund construction activities "
+                   f"on the project in {mmmm_yyyy(fc)}." if past_fc else
+                   "-- Further, the developer will secure financing to fund construction activities "
+                   f"on the project by {mmmm_yyyy(fc)}.")
         return ("Estimated Development Timeline:\n"
                 f"-- The project is estimated to be commercially operational by {mmmm_yyyy(op)}.\n"
-                f"{basis}\n"
-                "-- Further, the developer will secure financing to fund construction activities "
-                f"on the project by {mmmm_yyyy(fc)}.")
+                f"{basis}\n{fc_line}")
     if op_status == "Reported" and fc_status == "Estimated":
         if lifecycle == R.OPER:                                            # Case 3
             return ("Estimated Development Timeline:\n"
@@ -110,16 +116,15 @@ def timeline_section(fc_status, fc, op_status, op, lifecycle, secname) -> str | 
                     "-- Further, Enerdatics believes that developer would have secured financing "
                     f"to fund construction activities on the project by {mmmm_yyyy(fc)}.\n"
                     f"{basis}")
-        # DEFAULT: dev project with reported COD, FC estimated (not covered by SOP)
+        # DEFAULT: non-operational project with reported COD, FC estimated (not covered by SOP)
         return ("Estimated Development Timeline:\n"
-                "-- Enerdatics believes that the developer will have secured financing to fund "
+                f"{believes.replace('-- Further, E', '-- E')}to fund "
                 f"construction activities on the project by {mmmm_yyyy(fc)}.\n"
                 f"{basis}")
     if fc_status == "Estimated" and op_status == "Estimated":            # Case 4
         return ("Estimated Development Timeline:\n"
                 f"-- The project is estimated to be commercially operational by {mmmm_yyyy(op)}.\n"
-                "-- Further, Enerdatics believes that the developer will have secured financing "
-                f"to fund construction activities on the project by {mmmm_yyyy(fc)}.\n"
+                f"{believes}to fund construction activities on the project by {mmmm_yyyy(fc)}.\n"
                 f"{basis}")
     return None
 
@@ -166,3 +171,76 @@ def replace_timeline_in_place(existing: str, tl_sec: str | None) -> str:
     if not new:
         return text
     return (text.rstrip() + nl + nl + new) if text.strip() else new
+
+
+# ---------------------------------------------------------------- full timeline plan
+def _mi(d: dt.date) -> int:
+    return d.year * 12 + d.month
+
+
+RTB, CONSTR, CONSTR_DONE = "Ready-to-build", "In construction", "Construction complete"
+PLANNED = {R.EARLY, R.LATE, RTB, CONSTR, CONSTR_DONE, R.OPER}
+
+
+def plan_timeline(lc, sector, cap, run, fc_status, fc_rep, op_status, op_rep, op_est):
+    """Rebuild FC / COD for one project from the SOP rules.
+
+    Reported dates are kept when they fit the lifecycle; otherwise they are dropped and the
+    date is re-estimated. Estimated dates are always recalculated.
+    Returns (fc_status, fc, op_status, op, notes).
+    """
+    notes = []
+    minb = cod_min(sector)
+    fc_r = fc_rep if fc_status == "Reported" else None
+    op_r = op_rep if op_status == "Reported" else None
+
+    if lc in (R.EARLY, R.LATE, RTB):
+        stage = R.EARLY if lc == R.EARLY else R.LATE           # RtB follows the Late-stage rule
+        floor = add_months_eom(run, R.FC_MIN_MONTHS[stage])
+        if fc_r and fc_r < run:
+            notes.append(f"reported FC {fc_r:%m-%d-%Y} is in the past for a {lc} project")
+            fc_r = None
+        if op_r and _mi(op_r) - _mi(fc_r or floor) < minb:
+            notes.append(f"reported COD {op_r:%m-%d-%Y} cannot follow financial close")
+            op_r = None
+        if fc_r:
+            fc = fc_r
+        else:
+            fc = estimate_fc_dev(stage, cap, run)
+            if op_r:                                          # fit FC in front of the reported COD
+                fc = min(fc, add_months_eom(op_r, -minb))
+        op = op_r or estimate_cod_from_fc(fc, cap, sector)
+
+    elif lc in (CONSTR, CONSTR_DONE):
+        prev = add_months_eom(run, -1)
+        if fc_r and fc_r > run:
+            notes.append(f"reported FC {fc_r:%m-%d-%Y} is in the future for a {lc} project")
+            fc_r = None
+        if op_r and op_r < run:
+            notes.append(f"reported COD {op_r:%m-%d-%Y} is in the past but project is {lc}")
+            op_r = None
+        if op_r:
+            fc = fc_r or min(estimate_fc_from_cod(op_r, cap, sector), prev)
+            op = op_r
+        else:
+            fc = fc_r or prev
+            op = estimate_cod_from_fc(fc, cap, sector)
+            if op <= run:                                     # construction running late
+                op = add_months_eom(run, minb if lc == CONSTR else 1)
+
+    elif lc == R.OPER:
+        op = op_r or (op_est if op_status == "Estimated" else None)
+        if op and op > run:
+            notes.append(f"COD {op:%m-%d-%Y} is in the future for an Operational project (kept)")
+        if fc_r and op and fc_r > op:
+            notes.append(f"reported FC {fc_r:%m-%d-%Y} is after COD")
+            fc_r = None
+        fc = fc_r or (estimate_fc_from_cod(op, cap, sector) if op else None)
+        if not op:
+            notes.append("Operational project has no COD; FC not estimated")
+        return ("Reported" if fc_r else ("Estimated" if fc else fc_status),
+                fc, "Reported" if op_r else ("Estimated" if op else op_status), op, notes)
+    else:
+        return fc_status, None, op_status, None, notes
+
+    return ("Reported" if fc_r else "Estimated", fc, "Reported" if op_r else "Estimated", op, notes)
