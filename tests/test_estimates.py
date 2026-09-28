@@ -51,3 +51,20 @@ def test_field_rules():
                    "Financing type": "Pending finalization",
                    **{c: "x" for t in FR.STATUS_COLS for c in t}})
     assert cs["Financial close date status"] == R.NR and cs["Operational date (reported)"] == ""
+
+
+def test_plan_timeline_rules():
+    run = dt.date(2026, 9, 25)
+    # 300 MW early-stage: FC capped at 3 years, COD from FC
+    assert E.plan_timeline(R.EARLY, "Solar", 300, run, "Estimated", None, "Estimated", None, None)[:4] == \
+        ("Estimated", dt.date(2029, 9, 30), "Estimated", dt.date(2032, 9, 30))
+    # past reported FC is dropped; FC re-estimated and fitted before the reported COD
+    fs, fc, os_, op, notes = E.plan_timeline(R.EARLY, "Solar", 300, run, "Reported", dt.date(2025, 1, 1),
+                                             "Reported", dt.date(2028, 6, 30), None)
+    assert (fs, fc, os_, op) == ("Estimated", dt.date(2028, 3, 31), "Reported", dt.date(2028, 6, 30)) and notes
+    # reported COD too soon for an early-stage project is re-estimated
+    assert E.plan_timeline(R.EARLY, "Solar", 300, run, "", None, "Reported", dt.date(2026, 12, 31), None)[2] == "Estimated"
+    # in construction: FC in the past, COD in the future
+    fs, fc, os_, op, _ = E.plan_timeline("In construction", "Solar", 200, run, "Reported", dt.date(2025, 3, 1),
+                                         "Estimated", None, None)
+    assert fc < run < op
