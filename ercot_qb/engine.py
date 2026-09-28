@@ -205,21 +205,27 @@ def propose(rec: ErcotRec, row: dict, res: Result):
     return P
 
 
-def _val(m, status, est, rep):
-    """Date/amount behind a status: estimated column first, reported as fallback."""
-    return (m[rep] if m[status].strip() == "Reported" else (m[est] or m[rep])).strip()
-
-
-def _missing(m, status, est, rep):
+def _status_value(m, status, est, rep):
+    """Normalise a status/estimated/reported triple to (status, reported date, estimated date)."""
     st = m[status].strip()
-    return st in ("", R.NR) or (st == "Estimated" and not (m[est].strip() or m[rep].strip()))
+    r, e = parse_db_date(m[rep]), parse_db_date(m[est])
+    if st == "Reported":
+        return ("Reported", r, e) if r else ("", None, e)
+    if st == "Estimated":
+        return "Estimated", None, e or r
+    if not st or st == R.NR:
+        if st == "" and r:
+            return "Reported", r, e
+        if st == "" and e:
+            return "Estimated", None, e
+    return "", None, None
 
 
 def estimate_existing(row: dict, P: dict, run: dt.date, rec: ErcotRec, res: Result,
                       is_qc: bool = False) -> dict:
+    """Rebuild the timeline (and, for non-QC rows, the investment) for every in-scope row."""
     m = {**row, **P}
-    old_lc, new_lc = row[LC], m[LC]
-    changed = old_lc != new_lc
+    new_lc = m[LC]
     sector, sub = m["Sector"], m["Sub-sector"]
     cap = num(m[CAP])
     secname = E.sector_comment_name(sector, sub)
@@ -231,63 +237,36 @@ def estimate_existing(row: dict, P: dict, run: dt.date, rec: ErcotRec, res: Resu
             c = E.strip_auto_sections(row[AC])
             out[AC], out[SAC] = c, yn(c)
         return out
-    if new_lc not in (R.EARLY, R.LATE, R.OPER) or not cap or cap <= 0:
+    if new_lc not in E.PLANNED or not cap or cap <= 0:
         return out
 
-    fc_s, op_s, inv_s = m[FCS].strip(), m[OPS].strip(), m[INVS].strip()
-    fc = parse_db_date(_val(m, FCS, FCE, FCR))
-    op = parse_db_date(_val(m, OPS, OPE, OPR))
-    need_fc = fc_s != "Reported" and (changed or _missing(m, FCS, FCE, FCR))
-    need_op = new_lc != R.OPER and op_s != "Reported" and (changed or _missing(m, OPS, OPE, OPR))
-    need_inv = (not is_qc) and inv_s != "Reported" and (changed or _missing(m, INVS, INVE, INVR))
-    metric = None
-
-    if new_lc == R.OPER:
-        op = parse_db_date(m[OPR])
-        if need_fc and op:
-            fc = E.estimate_fc_from_cod(op, cap, sector)
-            out.update({FCS: "Estimated", FCE: fmt_date(fc), FCR: ""})
-            fc_s = "Estimated"
-    else:
-        if need_fc:
-            fc = E.estimate_fc_dev(new_lc, cap, run)
-            if op_s == "Reported" and op:
-                limit = E.add_months_eom(op, -E.cod_min(sector))
-                if fc > limit:
-                    floor = E.add_months_eom(run, R.FC_MIN_MONTHS[new_lc])
-                    fc = max(limit, floor)
-                    if limit < floor:
-                        res.flag("Reported COD too close to (or before) estimated FC", rec, row,
-                                 f"reported COD {fmt_date(op)}; estimated FC {fmt_date(fc)}")
-            out.update({FCS: "Estimated", FCE: fmt_date(fc), FCR: ""})
-            fc_s = "Estimated"
-        if need_op:
-            op = E.estimate_cod_from_fc(fc or E.estimate_fc_dev(new_lc, cap, run), cap, sector)
-            out.update({OPS: "Estimated", OPE: fmt_date(op), OPR: ""})
-            op_s = "Estimated"
-
-    if need_inv:
-        inv, metric = E.estimate_investment(sector, cap, new_lc, parse_db_date(m[OPR]), run)
-        out.update({INVS: "Estimated", INVE: str(inv), INVR: ""})
-        inv_s = "Estimated"
+    fc_s, fc_r, _ = _status_value(m, FCS, FCE, FCR)
+    op_s, op_r, op_e = _status_value(m, OPS, OPE, OPR)
+    fc_s, fc, op_s, op, notes = E.plan_timeline(new_lc, sector, cap, run, fc_s, fc_r, op_s, op_r, op_e)
+    for n in notes:
+        res.flag("Timeline: reported date did not fit the lifecycle", rec, row, n)
+    if fc:
+        out.update({FCS: fc_s, FCR: fmt_date(fc) if fc_s == "Reported" else "",
+                    FCE: fmt_date(fc) if fc_s == "Estimated" else ""})
+    if op:
+        out.update({OPS: op_s, OPR: fmt_date(op) if op_s == "Reported" else "",
+                    OPE: fmt_date(op) if op_s == "Estimated" else ""})
+    tl_sec = E.timeline_section(fc_s, fc, op_s, op, new_lc, secname, run) if (fc and op) else None
 
     if is_qc:
-        # QC rows: only the "Estimated development timeline" paragraph is touched
-        if changed or need_fc or need_op:
-            tl_sec = E.timeline_section(fc_s, fc, op_s, op, new_lc, secname) if (fc and op) else None
-            c = E.replace_timeline_in_place(row[AC], tl_sec)
-            out[AC], out[SAC] = c, yn(c)
+        # QC rows: investment untouched, only the "Estimated development timeline" paragraph changes
+        c = E.replace_timeline_in_place(row[AC], tl_sec)
+        out[AC], out[SAC] = c, yn(c)
         return out
 
-    if changed or need_fc or need_op or need_inv:
-        inv_sec = tl_sec = None
-        if metric is not None:
-            inv_sec = E.investment_section(num(out[INVE]), metric, secname)
-        if fc and op:
-            tl_sec = E.timeline_section(fc_s, fc, op_s, op, new_lc, secname)
-        replace_tl = changed or need_fc or need_op
-        c = E.rebuild_comment(row[AC], inv_sec, tl_sec, changed or need_inv, replace_tl)
-        out[AC], out[SAC] = c, yn(c)
+    inv_sec = None
+    if m[INVS].strip() != "Reported":
+        cod = op if op and op <= run else None
+        inv, metric = E.estimate_investment(sector, cap, new_lc, cod, run)
+        out.update({INVS: "Estimated", INVE: str(inv), INVR: ""})
+        inv_sec = E.investment_section(inv, metric, secname)
+    c = E.rebuild_comment(row[AC], inv_sec, tl_sec, True, True)
+    out[AC], out[SAC] = c, yn(c)
     return out
 
 
@@ -354,7 +333,7 @@ def build_new(rec: ErcotRec, lookup: CountyLookup, run: dt.date, res: Result) ->
     inv, metric = E.estimate_investment(rec.sector, cap, lc, op, run)
     r.update({INVS: "Estimated", INVE: str(inv)})
     parts = [E.investment_section(inv, metric, secname),
-             E.timeline_section("Estimated", fc, op_s, op, lc, secname)]
+             E.timeline_section("Estimated", fc, op_s, op, lc, secname, run)]
     r[AC] = "\n\n".join(p for p in parts if p)
     r[SAC] = yn(r[AC])
     r.update(FR.apply(r))
