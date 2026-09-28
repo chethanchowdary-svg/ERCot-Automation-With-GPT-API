@@ -10,6 +10,7 @@ User rules (Sep 2026):
   determined/Unavailable (blank only).
 - Financing secured = No  ->  Financing type blank (never "Pending finalization").
 - Status = Estimated  ->  value sits in the estimated column, reported column blank.
+  Status = Reported   ->  value sits in the reported column, estimated column blank.
 - Cancelled / Suspended: FC, operational and investment status = Not reported, need more data
   to estimate; estimated AND reported values cleared.
 """
@@ -68,4 +69,8 @@ def apply(m: dict) -> dict:
             if not g(est):
                 out[est] = m[rep]
             out[rep] = ""
+        elif g(st) == "Reported" and g(est):
+            if not g(rep):
+                out[rep] = m[est]
+            out[est] = ""
     return out
